@@ -213,6 +213,10 @@ function setup_grid(h=0.05)
         sleep(1)
         GC.gc()
         sleep(1)
+        Gmsh.finalize()
+        sleep(1)
+        GC.gc()
+        sleep(1)
         return g
     end
 
