@@ -205,8 +205,9 @@ function setup_grid(h=0.05)
     grid = mktempdir() do dir
         path = joinpath(dir, "mesh.msh")
         gmsh.write(path)
-        togrid(path)
+        g = togrid(path)
         Gmsh.finalize() # Test if this cleans up the file so Julia can remove tmpdir
+        return g
     end
 
     ## Finalize the Gmsh library
