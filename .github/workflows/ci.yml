@@ -11,6 +11,7 @@ jobs:
     name: Julia ${{ matrix.julia-version }} - ${{ matrix.os }} - ${{ github.event_name }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         julia-version: ['1.8.2', '1.8.3']
         os: ['windows-latest']
