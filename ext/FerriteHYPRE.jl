@@ -1,4 +1,4 @@
-module HYPREExt
+module FerriteHYPRE
 
 function __init__()
     @info "HYPREExt loaded"
@@ -15,7 +15,7 @@ using HYPRE.LibHYPRE: @check, HYPRE_BigInt, HYPRE_Complex, HYPRE_IJMatrixAddToVa
 
 function Ferrite.create_sparsity_pattern(::Type{<:HYPREMatrix}, dh::DofHandler, ch::Union{ConstraintHandler,Nothing}=nothing; kwargs...)
     K = create_sparsity_pattern(dh, ch; kwargs...)
-    fill!(K.nzval, 1)
+    fill!(K.nzval, 1) # TODO: Is this needed?
     return HYPREMatrix(K)
 end
 
@@ -59,4 +59,4 @@ function Ferrite.addindex!(b::HYPREVector, v, i::Int)
     return b
 end
 
-end # module
+end # module FerriteHYPRE
