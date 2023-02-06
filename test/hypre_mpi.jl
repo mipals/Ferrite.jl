@@ -1,12 +1,12 @@
-using Ferrite, MPI, HYPRE, Metis
+using Ferrite, MPI, HYPRE, Metis, TimerOutputs
 
 # Initialize MPI and HYPRE
 MPI.Init()
 HYPRE.Init()
 
 const comm = MPI.COMM_WORLD
-const root = 0
-const rank = MPI.Comm_rank(comm)
+const root = 0                   + 1
+const rank = MPI.Comm_rank(comm) + 1
 const comm_size = MPI.Comm_size(comm)
 
 # No changes from serial solve
@@ -35,7 +35,7 @@ function assemble_global(cellvalues::CellScalarValues, A::HYPREMatrix, b::HYPREV
     Ke = zeros(n_basefuncs, n_basefuncs)
     fe = zeros(n_basefuncs)
     assembler = start_assemble(A, b)
-    for cell in CellIterator(dh, getcellset(dh.grid, "##proc-$(rank)##"))
+    for cell in CellIterator(dh, getcellset(dh.grid, "proc-$(rank)"))
         reinit!(cellvalues, cell)
         assemble_element!(Ke, fe, cellvalues)
         apply_local!(Ke, fe, celldofs(cell), ch)
@@ -50,12 +50,8 @@ end
 function partition_grid!(grid)
     # TODO: Can this be done on all ranks? Not sure if Metis is deterministic.
     if rank == root
-        if comm_size == 1
-            parts = ones(Cint, getncells(grid))
-        else
-            cell_connectivity = Ferrite.create_incidence_matrix(grid)
-            parts = Metis.partition(cell_connectivity, comm_size)
-        end
+        cell_connectivity = Ferrite.create_incidence_matrix(grid)
+        parts = Metis.partition(cell_connectivity, comm_size)
     else
         parts = Vector{Cint}(undef, getncells(grid))
     end
@@ -66,47 +62,53 @@ function partition_grid!(grid)
     for (cell_id, part_id) in pairs(parts)
         push!(sets[part_id], cell_id)
     end
-    for p in 0:comm_size-1
-        addcellset!(grid, "##proc-$p##", sets[p+1])
+    for p in 1:comm_size
+        addcellset!(grid, "proc-$p", sets[p])
     end
     return grid
 end
 
-function main()
+function main(n)
+
+    reset_timer!()
 
     # Create the grid
-    grid = generate_grid(Quadrilateral, (20, 20));
+    @timeit "Generate grid" grid = generate_grid(Quadrilateral, (n, n))
 
     # Partition the mesh
-    partition_grid!(grid)
+    @timeit "Partition grid" partition_grid!(grid)
 
     # Create the DofHandler
-    dh = DofHandler(grid)
-    push!(dh, :u, 1)
-    close!(dh);
+    @timeit "Create DofHandler" begin
+        dh = DofHandler(grid)
+        push!(dh, :u, 1)
+        close!(dh)
+    end
 
-    # Renumber by part
-    all = Set{Int}()
-    sets = [Set{Int}() for _ in 1:comm_size]
-    cc = CellCache(dh)
-    for p in 0:comm_size-1
-        set = sets[p+1]
-        for cell_id in getcellset(grid, "##proc-$p##")
-            reinit!(cc, cell_id)
-            union!(set, cc.dofs)
+    # Renumber dofs by part
+    @timeit "Renumber DoFs by processor" begin
+        all = Set{Int}()
+        sets = [Set{Int}() for _ in 1:comm_size]
+        cc = CellCache(dh)
+        for p in 1:comm_size
+            set = sets[p]
+            for cell_id in getcellset(grid, "proc-$p")
+                reinit!(cc, cell_id)
+                union!(set, cc.dofs)
+            end
+            setdiff!(set, all)
+            union!(all, set)
         end
-        setdiff!(set, all)
-        union!(all, set)
+        iperm = Int[]
+        rank_dof_ranges = UnitRange{Int}[]
+        for set in sets
+            push!(rank_dof_ranges, (length(iperm)+1):(length(iperm)+length(set)))
+            append!(iperm, sort!(collect(set)))
+        end
+        perm = invperm(iperm)
+        renumber!(dh, perm)
+        rank_dof_range = rank_dof_ranges[rank]
     end
-    iperm = Int[]
-    rank_dof_ranges = UnitRange{Int}[]
-    for set in sets
-        push!(rank_dof_ranges, (length(iperm)+1):(length(iperm)+length(set)))
-        append!(iperm, sort!(collect(set)))
-    end
-    perm = invperm(iperm)
-    renumber!(dh, perm)
-    rank_dof_range = rank_dof_ranges[rank+1]
 
     # FE Values
     cellvalues = let
@@ -117,16 +119,18 @@ function main()
     end
 
     # ConstraintHandler
-    ch = ConstraintHandler(dh)
-    ∂Ω = union(
-        getfaceset(grid, "left"),
-        getfaceset(grid, "right"),
-        getfaceset(grid, "top"),
-        getfaceset(grid, "bottom"),
-    )
-    dbc = Dirichlet(:u, ∂Ω, (x, t) -> 0)
-    add!(ch, dbc);
-    close!(ch)
+    @timeit "Create ConstraintHandler" begin
+        ch = ConstraintHandler(dh)
+        ∂Ω = union(
+            getfaceset(grid, "left"),
+            getfaceset(grid, "right"),
+            getfaceset(grid, "top"),
+            getfaceset(grid, "bottom"),
+        )
+        dbc = Dirichlet(:u, ∂Ω, (x, t) -> 0)
+        add!(ch, dbc);
+        close!(ch)
+    end
 
 
     # Set up HYPRE arrays
@@ -135,37 +139,52 @@ function main()
     b = HYPREVector(comm, ilower, iupper)
 
     # Assemble
-    assemble_global(cellvalues, A, b, dh, ch)
+    @timeit "Assembly ($(length(getcellset(grid, "proc-$(rank)"))) of $(getncells(grid)) elements)" begin
+        assemble_global(cellvalues, A, b, dh, ch)
+    end
 
     # Set up solver and solve
-    precond = HYPRE.BoomerAMG()
-    solver = HYPRE.PCG(; Precond = precond)
-    xh = HYPRE.solve(solver, A, b)
+    @timeit "HYPRE setup and solve" begin
+        precond = HYPRE.BoomerAMG()
+        solver = HYPRE.PCG(; Precond = precond)
+        xh = HYPRE.solve(solver, A, b)
+    end
 
     # Copy solution from HYPRE to Julia
-    x = Vector{Float64}(undef, length(rank_dof_range))
-    copy!(x, xh)
+    @timeit "Collect solution to root for VTK output" begin
+        x = Vector{Float64}(undef, length(rank_dof_range))
+        copy!(x, xh)
 
-    # Collect to root rank
-    if rank == root
-        X = Vector{Float64}(undef, ndofs(dh))
-        counts = length.(rank_dof_ranges)
-        MPI.Gatherv!(x, VBuffer(X, counts), comm)
-    else
-        MPI.Gatherv!(x, nothing, comm)
+        # Collect to root rank
+        if rank == root
+            X = Vector{Float64}(undef, ndofs(dh))
+            counts = length.(rank_dof_ranges)
+            MPI.Gatherv!(x, VBuffer(X, counts), comm)
+        else
+            MPI.Gatherv!(x, nothing, comm)
+        end
     end
 
     ### Exporting to VTK
     if rank == root
-        vtk_grid("heat_equation", dh) do vtk
-            vtk_point_data(vtk, dh, X)
-        end
-        @show norm(X)
-        @show norm(X) ≈ 3.307743912641305
+        # @timeit "VTK export" begin
+        #     vtk_grid("heat_equation", dh) do vtk
+        #         vtk_point_data(vtk, dh, X)
+        #     end
+        #     # @show norm(X)
+        #     # @show norm(X) ≈ 3.307743912641305
+        # end
     end
+
+    # Print the timer on root proc
+    rank == root && print_timer()
+
+    return
 end
 
 # Run it!
 if abspath(PROGRAM_FILE) == @__FILE__
-    main()
+    n = parse(Int, get(ARGS, 1, "100"))
+    main(n)
+    main(n)
 end
