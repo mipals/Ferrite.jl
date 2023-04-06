@@ -114,6 +114,7 @@ export
     Field,
     reshape_to_nodes,
     apply_analytical!,
+    collect_dofs,
 
 # Constraints
     ConstraintHandler,
